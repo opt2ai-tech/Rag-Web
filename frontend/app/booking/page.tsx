@@ -1,13 +1,13 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import DatePicker from 'react-datepicker';
 import 'react-datepicker/dist/react-datepicker.css';
 import { api, Room, Booking } from '@/lib/api';
 
-export default function BookingPage() {
+function BookingPageContent() {
   const searchParams = useSearchParams();
   const preselectedRoomId = searchParams.get('room');
 
@@ -248,5 +248,14 @@ export default function BookingPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+export default function BookingPage() {
+  // `useSearchParams()` requires a Suspense boundary for static generation.
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-gray-50" />}>
+      <BookingPageContent />
+    </Suspense>
   );
 }

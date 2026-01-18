@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from typing import List
+from pathlib import Path
+import errno
 import os
 import shutil
+import uuid
 from app.database.connection import get_supabase
 from app.models import schemas
 from app.api.dependencies import get_admin_user
@@ -9,8 +12,51 @@ from app.core.config import settings
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-# Create upload directory if it doesn't exist
-os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+def _ensure_writable_dir(dir_path: Path) -> None:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    # Best-effort writability check (some platforms allow mkdir but not file writes)
+    probe_path = dir_path / ".__write_probe__"
+    with open(probe_path, "wb") as f:
+        f.write(b"ok")
+    try:
+        probe_path.unlink(missing_ok=True)
+    except TypeError:
+        # Python < 3.8 compatibility (missing_ok)
+        if probe_path.exists():
+            probe_path.unlink()
+
+
+def _get_upload_dir() -> Path:
+    """
+    Return a writable upload directory.
+
+    Some serverless runtimes mount the app code on a read-only filesystem.
+    In those cases, only `/tmp` is writable.
+    """
+    configured = Path(settings.UPLOAD_DIR)
+    candidates: List[Path] = [configured]
+    if not configured.is_absolute():
+        candidates.append(Path("/tmp") / configured)
+    candidates.append(Path("/tmp/uploads"))
+
+    for candidate in candidates:
+        try:
+            _ensure_writable_dir(candidate)
+            return candidate
+        except OSError as e:
+            # Try the next candidate for common "not writable" errors
+            if e.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+                continue
+            continue
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=(
+            "Server upload directory is not writable. "
+            "Set UPLOAD_DIR to a writable path (e.g. /tmp/uploads in serverless) "
+            "or use external object storage for uploads."
+        ),
+    )
 
 @router.post("/upload", response_model=schemas.Document)
 async def upload_document(
@@ -40,7 +86,10 @@ async def upload_document(
         )
     
     # Save file
-    file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
+    upload_dir = _get_upload_dir()
+    original_name = os.path.basename(file.filename or "upload")
+    stored_name = f"{uuid.uuid4().hex}_{original_name}"
+    file_path = str(upload_dir / stored_name)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
@@ -67,6 +116,13 @@ async def upload_document(
     except Exception as e:
         # Log error but don't fail the upload
         print(f"Error processing document: {str(e)}")
+    finally:
+        # Cleanup: serverless filesystems are ephemeral; avoid leaving temp files around.
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
     
     return db_document
 
@@ -98,8 +154,9 @@ async def delete_document(
     document = result.data[0]
     
     # Delete file from filesystem
-    if os.path.exists(document["file_path"]):
-        os.remove(document["file_path"])
+    file_path = document.get("file_path")
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
     
     # Delete from database (cascades to chunks via foreign key)
     supabase.table("documents").delete().eq("id", document_id).execute()
